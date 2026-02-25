@@ -1,0 +1,39 @@
+### Quickstart
+
+```bash
+brew update && brew install azure-cli
+az login
+cd infra/root/
+terraform init
+terraform apply
+cd ..
+cd crawl/
+terraform init
+terraform workspace new dev
+terraform apply
+
+# Configure GitHub Actions for ACR deployment
+# 1. Fetch the service principal credentials and ACR login server
+APP_CLIENT_ID=$(terraform output -raw app_client_id)
+APP_PASSWORD=$(terraform output -raw app_password)
+ACR_LOGIN_SERVER=$(az acr list --query "[].loginServer" -o tsv)
+gh secret set AZURE_REGISTRY --body "$ACR_LOGIN_SERVER"
+gh secret set AZURE_CLIENT_ID --body "$APP_CLIENT_ID"
+gh secret set AZURE_CLIENT_SECRET --body "$APP_PASSWORD"
+
+# Deploy database utils
+cd infra/db/
+terraform init
+terraform workspace new dev
+terraform apply
+```
+
+### Run crawl local
+
+```bash
+cd crawl/
+set -x AZURE_CONTAINER "<>"
+set -x AZURE_ACCOUNT_URL "<>"
+set -x AZURE_ACCOUNT_KEY "<>"
+scrapy crawl crawl-game-ids
+```
