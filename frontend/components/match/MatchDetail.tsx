@@ -97,7 +97,6 @@ export function MatchDetail({ data }: { data: MatchData }) {
       {data.shapValues && (
         <ShapForcePlotExpanded
           shap={data.shapValues}
-          win={data.match.matchSummary.win}
         />
       )}
     </div>

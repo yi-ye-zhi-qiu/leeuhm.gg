@@ -24,6 +24,12 @@ export function MatchRowSkeleton() {
             <Skeleton key={i} className="h-6 w-6 rounded" />
           ))}
         </div>
+        {/* WFactor skeleton */}
+        <div className="flex flex-1 flex-col gap-0.5 min-w-0">
+          <div className="h-3" />
+          <Skeleton className="h-3.5 w-full rounded" />
+          <Skeleton className="mx-auto h-3 w-16 rounded-sm" />
+        </div>
         <div className="ml-auto flex gap-3">
           <div className="flex flex-col gap-px">
             {Array.from({ length: 5 }).map((_, i) => (
