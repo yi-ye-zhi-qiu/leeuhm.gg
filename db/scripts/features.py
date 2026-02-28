@@ -1,6 +1,7 @@
-"""SQL-first feature extraction from Synapse for XGBoost training.
+"""Feature extraction from Synapse for XGBoost training.
 
-Extracts ~80 raw/derived columns per player per match via CROSS APPLY + OUTER APPLY:
+SQL fetches raw match documents in a single blob scan.
+Python expands to per-player rows with ~80 columns:
   - Player stats from postGameData (10 rows per match)
   - Rank tier + LP from allPlayerRanks
   - Performance scores (hardCarry, teamplay, damageShare, etc.)
@@ -10,28 +11,26 @@ Extracts ~80 raw/derived columns per player per match via CROSS APPLY + OUTER AP
   - Diff frame phase averages (CS/gold/KA/XP, primary player only)
   - Team objectives (baron, dragon, tower, inhibitor, riftHerald)
   - Items (item0-item6), summoner spells (spell0, spell1), runes (keystone, subStyle)
-  - Team compositions as JSON (for champion interaction encoding in Python)
+  - Team compositions (for champion interaction encoding)
 
 Game phase boundaries (timeline timestamps in ms):
   Early:  timestamp < matchDurationSec * 250       (first 25%)
-  Mid:    timestamp >= matchDurationSec * 250
-          AND      < matchDurationSec * 500         (25%-50%)
-  Late:   timestamp >= matchDurationSec * 500       (last 50%)
+  Mid:    >= matchDurationSec * 250  AND  < * 500   (25%-50%)
+  Late:   >= matchDurationSec * 500                 (last 50%)
 
-Diff frame timestamps are minute indices, so thresholds are:
-  Early:  ts < matchDurationSec / 60.0 * 0.25
-  Mid:    ts >= matchDurationSec / 60.0 * 0.25  AND  < matchDurationSec / 60.0 * 0.5
-  Late:   ts >= matchDurationSec / 60.0 * 0.5
+Diff frame timestamps are minute indices, so thresholds use matchDurationMin * 0.25/0.5.
 
-Teamfight definition: GROUP BY FLOOR(timestamp / 15000) HAVING COUNT(*) >= 2
+Teamfight definition: 15s window with >= 2 champion kills.
 
 Usage:
     SYNAPSE_PASSWORD=... python db/scripts/features.py [--region na1]
 """
 
 import os
+import json
 import argparse
 import logging
+from math import floor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
@@ -43,130 +42,21 @@ DATABASE = "crawldb"
 USERNAME = os.environ.get("SYNAPSE_USER", "sqladmin")
 PASSWORD = os.environ.get("SYNAPSE_PASSWORD", "")
 
+DRAGON_TYPES = [
+    "infernal_dragon",
+    "mountain_dragon",
+    "ocean_dragon",
+    "hextech_dragon",
+    "chemtech_dragon",
+    "cloud_dragon",
+]
 
-def build_query(region: str) -> str:
-    """Build the comprehensive feature extraction SQL query for a region."""
+
+def build_query(region: str, limit: int | None = None) -> str:
+    """Single blob-scan query returning raw match documents."""
+    top = f"TOP {limit}" if limit else ""
     return f"""
-    SELECT
-        -- === Match identifiers ===
-        m.matchId,
-        m.matchDurationSec,
-        m.winningTeam,
-        m.matchCreationTime,
-        m.primaryUserName,
-        m.primaryTagLine,
-
-        -- === Player stats ===
-        p.riotUserName,
-        p.riotTagLine,
-        p.championId,
-        p.teamId,
-        p.role,
-        p.kills,
-        p.deaths,
-        p.assists,
-        p.cs,
-        p.jungleCs,
-        p.damage,
-        p.damageTaken,
-        p.gold,
-        p.level,
-        p.wardsPlaced,
-        p.carryPercentage,
-        p.item0, p.item1, p.item2, p.item3, p.item4, p.item5, p.item6,
-        p.spell0, p.spell1,
-        p.keystone, p.subStyle,
-
-        -- === Rank ===
-        rk.tier AS rank_tier,
-        rk.lp AS rank_lp,
-
-        -- === Performance scores ===
-        ps.hardCarry,
-        ps.teamplay,
-        ps.damageShareTotal,
-        ps.goldShareTotal,
-        ps.killParticipationTotal,
-        ps.visionScoreTotal,
-        ps.finalLvlDiffTotal,
-
-        -- === Team objectives (player's own team) ===
-        CASE WHEN p.teamId = 100
-            THEN CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamOneOverview.baronKills') AS INT)
-            ELSE CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamTwoOverview.baronKills') AS INT)
-        END AS baron_kills,
-        CASE WHEN p.teamId = 100
-            THEN CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamOneOverview.dragonKills') AS INT)
-            ELSE CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamTwoOverview.dragonKills') AS INT)
-        END AS dragon_kills,
-        CASE WHEN p.teamId = 100
-            THEN CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamOneOverview.towerKills') AS INT)
-            ELSE CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamTwoOverview.towerKills') AS INT)
-        END AS tower_kills,
-        CASE WHEN p.teamId = 100
-            THEN CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamOneOverview.inhibitorKills') AS INT)
-            ELSE CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamTwoOverview.inhibitorKills') AS INT)
-        END AS inhibitor_kills,
-        CASE WHEN p.teamId = 100
-            THEN CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamOneOverview.riftHeraldKills') AS INT)
-            ELSE CAST(JSON_VALUE(doc, '$.data.match.historicalData.teamTwoOverview.riftHeraldKills') AS INT)
-        END AS rift_herald_kills,
-
-        -- === Timeline per-player phase aggregates ===
-        tl.early_kills, tl.mid_kills, tl.late_kills,
-        tl.early_deaths, tl.mid_deaths, tl.late_deaths,
-        tl.early_wards, tl.mid_wards, tl.late_wards,
-
-        -- === Dragon features (match-level) ===
-        dr.total_dragons, dr.elder_count,
-        dr.infernal, dr.mountain, dr.ocean,
-        dr.hextech, dr.chemtech, dr.cloud,
-
-        -- === Teamfights per phase (match-level) ===
-        tf.early_teamfights, tf.mid_teamfights, tf.late_teamfights,
-
-        -- === Diff frame phase averages (primary player only, 0 for others) ===
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN csd.cs_diff_early ELSE 0 END AS cs_diff_early,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN csd.cs_diff_mid ELSE 0 END AS cs_diff_mid,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN csd.cs_diff_late ELSE 0 END AS cs_diff_late,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN gdd.gold_diff_early ELSE 0 END AS gold_diff_early,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN gdd.gold_diff_mid ELSE 0 END AS gold_diff_mid,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN gdd.gold_diff_late ELSE 0 END AS gold_diff_late,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN kad.ka_diff_early ELSE 0 END AS ka_diff_early,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN kad.ka_diff_mid ELSE 0 END AS ka_diff_mid,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN kad.ka_diff_late ELSE 0 END AS ka_diff_late,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN xpd.xp_diff_early ELSE 0 END AS xp_diff_early,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN xpd.xp_diff_mid ELSE 0 END AS xp_diff_mid,
-        CASE WHEN p.riotUserName = m.primaryUserName
-              AND p.riotTagLine  = m.primaryTagLine
-             THEN xpd.xp_diff_late ELSE 0 END AS xp_diff_late,
-
-        -- === Team compositions (for champion interaction encoding in Python) ===
-        JSON_QUERY(doc, '$.data.match.matchSummary.teamA') AS teamA_json,
-        JSON_QUERY(doc, '$.data.match.matchSummary.teamB') AS teamB_json
-
+    SELECT {top} *
     FROM OPENROWSET(
         BULK 'teemo/0.0.0/{region}/*.jsonl.gz',
         DATA_SOURCE = 'CrawlStorage',
@@ -175,290 +65,296 @@ def build_query(region: str) -> str:
         FIELDQUOTE = '0x0b',
         ROWTERMINATOR = '0x0a'
     ) WITH (doc NVARCHAR(MAX)) AS r
-
-    ---------------------------------------------------------------------------
-    -- Match-level scalars (avoids repeated JSON_VALUE calls)
-    ---------------------------------------------------------------------------
-    CROSS APPLY (
-        SELECT
-            JSON_VALUE(doc, '$.data.match.historicalData.matchId') AS matchId,
-            CAST(JSON_VALUE(doc, '$.data.match.matchSummary.matchDuration') AS FLOAT) AS matchDurationSec,
-            CAST(JSON_VALUE(doc, '$.data.match.winningTeam') AS INT) AS winningTeam,
-            CAST(JSON_VALUE(doc, '$.data.match.matchSummary.matchCreationTime') AS BIGINT) AS matchCreationTime,
-            JSON_VALUE(doc, '$.data.match.playerInfo.riotUserName') AS primaryUserName,
-            JSON_VALUE(doc, '$.data.match.playerInfo.riotTagLine') AS primaryTagLine
-    ) AS m
-
-    ---------------------------------------------------------------------------
-    -- 10 player rows from postGameData
-    ---------------------------------------------------------------------------
-    CROSS APPLY OPENJSON(doc, '$.data.match.historicalData.postGameData') WITH (
-        riotUserName    NVARCHAR(100) '$.riotUserName',
-        riotTagLine     NVARCHAR(100) '$.riotTagLine',
-        championId      INT           '$.championId',
-        teamId          INT           '$.teamId',
-        role            INT           '$.role',
-        kills           INT           '$.kills',
-        deaths          INT           '$.deaths',
-        assists         INT           '$.assists',
-        cs              INT           '$.cs',
-        jungleCs        INT           '$.jungleCs',
-        damage          INT           '$.damage',
-        damageTaken     INT           '$.damageTaken',
-        gold            INT           '$.gold',
-        level           INT           '$.level',
-        wardsPlaced     INT           '$.wardsPlaced',
-        carryPercentage FLOAT         '$.carryPercentage',
-        item0           INT           '$.items[0]',
-        item1           INT           '$.items[1]',
-        item2           INT           '$.items[2]',
-        item3           INT           '$.items[3]',
-        item4           INT           '$.items[4]',
-        item5           INT           '$.items[5]',
-        item6           INT           '$.items[6]',
-        spell0          INT           '$.summonerSpells[0]',
-        spell1          INT           '$.summonerSpells[1]',
-        keystone        INT           '$.keystone',
-        subStyle        INT           '$.subStyle'
-    ) AS p
-
-    ---------------------------------------------------------------------------
-    -- Rank (solo queue preferred) for this player
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT TOP 1 rs.tier, rs.lp
-        FROM OPENJSON(doc, '$.data.match.allPlayerRanks') WITH (
-            riotUserName NVARCHAR(100)  '$.riotUserName',
-            riotTagLine  NVARCHAR(100)  '$.riotTagLine',
-            rankScores   NVARCHAR(MAX)  '$.rankScores' AS JSON
-        ) AS pr
-        CROSS APPLY OPENJSON(pr.rankScores) WITH (
-            tier      NVARCHAR(50)  '$.tier',
-            lp        INT           '$.lp',
-            queueType NVARCHAR(50)  '$.queueType'
-        ) AS rs
-        WHERE pr.riotUserName = p.riotUserName
-          AND pr.riotTagLine  = p.riotTagLine
-          AND rs.queueType    = 'ranked_solo_5x5'
-    ) AS rk
-
-    ---------------------------------------------------------------------------
-    -- Performance score for this player
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT TOP 1
-            ps_i.hardCarry,
-            ps_i.teamplay,
-            ps_i.damageShareTotal,
-            ps_i.goldShareTotal,
-            ps_i.killParticipationTotal,
-            ps_i.visionScoreTotal,
-            ps_i.finalLvlDiffTotal
-        FROM OPENJSON(doc, '$.data.match.performanceScore') WITH (
-            riotUserName          NVARCHAR(100) '$.riotUserName',
-            riotTagLine           NVARCHAR(100) '$.riotTagLine',
-            hardCarry             FLOAT         '$.hardCarry',
-            teamplay              FLOAT         '$.teamplay',
-            damageShareTotal      FLOAT         '$.damageShareTotal',
-            goldShareTotal        FLOAT         '$.goldShareTotal',
-            killParticipationTotal FLOAT        '$.killParticipationTotal',
-            visionScoreTotal      FLOAT         '$.visionScoreTotal',
-            finalLvlDiffTotal     FLOAT         '$.finalLvlDiffTotal'
-        ) AS ps_i
-        WHERE ps_i.riotUserName = p.riotUserName
-          AND ps_i.riotTagLine  = p.riotTagLine
-    ) AS ps
-
-    ---------------------------------------------------------------------------
-    -- Per-player kills, deaths, wards by game phase
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts < m.matchDurationSec * 250
-                 THEN 1 ELSE 0 END) AS early_kills,
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 250 AND e.ts < m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS mid_kills,
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS late_kills,
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.victim_name = p.riotUserName AND e.victim_tag = p.riotTagLine
-                      AND e.ts < m.matchDurationSec * 250
-                 THEN 1 ELSE 0 END) AS early_deaths,
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.victim_name = p.riotUserName AND e.victim_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 250 AND e.ts < m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS mid_deaths,
-            SUM(CASE WHEN e.eventType = 'champion_kill'
-                      AND e.victim_name = p.riotUserName AND e.victim_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS late_deaths,
-            SUM(CASE WHEN e.eventType = 'ward_placed'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts < m.matchDurationSec * 250
-                 THEN 1 ELSE 0 END) AS early_wards,
-            SUM(CASE WHEN e.eventType = 'ward_placed'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 250 AND e.ts < m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS mid_wards,
-            SUM(CASE WHEN e.eventType = 'ward_placed'
-                      AND e.killer_name = p.riotUserName AND e.killer_tag = p.riotTagLine
-                      AND e.ts >= m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS late_wards
-        FROM OPENJSON(doc, '$.data.match.historicalData.timelineData') WITH (
-            eventType   NVARCHAR(50)  '$.eventType',
-            ts          BIGINT        '$.timestamp',
-            killer_name NVARCHAR(100) '$.riotUserName',
-            killer_tag  NVARCHAR(100) '$.riotTagLine',
-            victim_name NVARCHAR(100) '$.victimRiotUserName',
-            victim_tag  NVARCHAR(100) '$.victimRiotTagLine'
-        ) AS e
-        WHERE e.eventType IN ('champion_kill', 'ward_placed')
-    ) AS tl
-
-    ---------------------------------------------------------------------------
-    -- Dragon features (match-level)
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            COUNT(*)
-                AS total_dragons,
-            SUM(CASE WHEN d.monsterSubtype = 'elder_dragon'    THEN 1 ELSE 0 END) AS elder_count,
-            SUM(CASE WHEN d.monsterSubtype = 'infernal_dragon' THEN 1 ELSE 0 END) AS infernal,
-            SUM(CASE WHEN d.monsterSubtype = 'mountain_dragon' THEN 1 ELSE 0 END) AS mountain,
-            SUM(CASE WHEN d.monsterSubtype = 'ocean_dragon'    THEN 1 ELSE 0 END) AS ocean,
-            SUM(CASE WHEN d.monsterSubtype = 'hextech_dragon'  THEN 1 ELSE 0 END) AS hextech,
-            SUM(CASE WHEN d.monsterSubtype = 'chemtech_dragon' THEN 1 ELSE 0 END) AS chemtech,
-            SUM(CASE WHEN d.monsterSubtype = 'cloud_dragon'    THEN 1 ELSE 0 END) AS cloud
-        FROM OPENJSON(doc, '$.data.match.historicalData.timelineData') WITH (
-            monsterType    NVARCHAR(50) '$.monsterType',
-            monsterSubtype NVARCHAR(50) '$.monsterSubtype'
-        ) AS d
-        WHERE d.monsterType = 'dragon'
-    ) AS dr
-
-    ---------------------------------------------------------------------------
-    -- Teamfight buckets per phase (15s windows with >= 2 kills)
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            SUM(CASE WHEN b.bucket_ts < m.matchDurationSec * 250
-                 THEN 1 ELSE 0 END) AS early_teamfights,
-            SUM(CASE WHEN b.bucket_ts >= m.matchDurationSec * 250
-                      AND b.bucket_ts <  m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS mid_teamfights,
-            SUM(CASE WHEN b.bucket_ts >= m.matchDurationSec * 500
-                 THEN 1 ELSE 0 END) AS late_teamfights
-        FROM (
-            SELECT
-                FLOOR(t.ts / 15000) * 15000 AS bucket_ts,
-                COUNT(*) AS kill_count
-            FROM OPENJSON(doc, '$.data.match.historicalData.timelineData') WITH (
-                eventType NVARCHAR(50) '$.eventType',
-                ts        BIGINT       '$.timestamp'
-            ) AS t
-            WHERE t.eventType = 'champion_kill'
-            GROUP BY FLOOR(t.ts / 15000)
-            HAVING COUNT(*) >= 2
-        ) AS b
-    ) AS tf
-
-    ---------------------------------------------------------------------------
-    -- CS diff frame phase averages
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            AVG(CASE WHEN f.ts < m.matchDurationSec / 60.0 * 0.25
-                     THEN f.youValue - f.oppValue END) AS cs_diff_early,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.25
-                      AND f.ts <  m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS cs_diff_mid,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS cs_diff_late
-        FROM OPENJSON(doc, '$.data.match.historicalData.csDifferenceFrames') WITH (
-            ts       INT   '$.timestamp',
-            youValue FLOAT '$.youValue',
-            oppValue FLOAT '$.oppValue'
-        ) AS f
-    ) AS csd
-
-    ---------------------------------------------------------------------------
-    -- Gold diff frame phase averages
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            AVG(CASE WHEN f.ts < m.matchDurationSec / 60.0 * 0.25
-                     THEN f.youValue - f.oppValue END) AS gold_diff_early,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.25
-                      AND f.ts <  m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS gold_diff_mid,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS gold_diff_late
-        FROM OPENJSON(doc, '$.data.match.historicalData.goldDifferenceFrames') WITH (
-            ts       INT   '$.timestamp',
-            youValue FLOAT '$.youValue',
-            oppValue FLOAT '$.oppValue'
-        ) AS f
-    ) AS gdd
-
-    ---------------------------------------------------------------------------
-    -- KA diff frame phase averages
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            AVG(CASE WHEN f.ts < m.matchDurationSec / 60.0 * 0.25
-                     THEN f.youValue - f.oppValue END) AS ka_diff_early,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.25
-                      AND f.ts <  m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS ka_diff_mid,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS ka_diff_late
-        FROM OPENJSON(doc, '$.data.match.historicalData.kaDifferenceFrames') WITH (
-            ts       INT   '$.timestamp',
-            youValue FLOAT '$.youValue',
-            oppValue FLOAT '$.oppValue'
-        ) AS f
-    ) AS kad
-
-    ---------------------------------------------------------------------------
-    -- XP diff frame phase averages
-    ---------------------------------------------------------------------------
-    OUTER APPLY (
-        SELECT
-            AVG(CASE WHEN f.ts < m.matchDurationSec / 60.0 * 0.25
-                     THEN f.youValue - f.oppValue END) AS xp_diff_early,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.25
-                      AND f.ts <  m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS xp_diff_mid,
-            AVG(CASE WHEN f.ts >= m.matchDurationSec / 60.0 * 0.5
-                     THEN f.youValue - f.oppValue END) AS xp_diff_late
-        FROM OPENJSON(doc, '$.data.match.historicalData.xpDifferenceFrames') WITH (
-            ts       INT   '$.timestamp',
-            youValue FLOAT '$.youValue',
-            oppValue FLOAT '$.oppValue'
-        ) AS f
-    ) AS xpd
-
-    WHERE m.winningTeam IS NOT NULL
-      AND m.matchDurationSec > 300
+    WHERE JSON_VALUE(doc, '$.data.match.winningTeam') IS NOT NULL
     """
 
 
-def query_features(region: str):
-    """Execute the feature extraction query and return a DataFrame."""
+def _phase(ts_ms: float, duration_sec: float) -> int:
+    """Classify a millisecond timestamp into game phase (1=early, 2=mid, 3=late)."""
+    if ts_ms < duration_sec * 250:
+        return 1
+    elif ts_ms < duration_sec * 500:
+        return 2
+    return 3
+
+
+def _diff_phase(ts_min: int, duration_sec: float) -> int:
+    """Classify a minute-index timestamp into game phase."""
+    dm = duration_sec / 60.0
+    if ts_min < dm * 0.25:
+        return 1
+    elif ts_min < dm * 0.5:
+        return 2
+    return 3
+
+
+def _phase_avg(frames: list[dict], duration_sec: float) -> dict[int, float]:
+    """Compute average (youValue - oppValue) per phase from diff frames."""
+    buckets: dict[int, list[float]] = {1: [], 2: [], 3: []}
+    for f in frames:
+        phase = _diff_phase(f.get("timestamp", 0), duration_sec)
+        diff = (f.get("youValue", 0) or 0) - (f.get("oppValue", 0) or 0)
+        buckets[phase].append(diff)
+    return {p: (sum(v) / len(v) if v else 0.0) for p, v in buckets.items()}
+
+
+def _extract_dragons(timeline: list[dict]) -> dict:
+    """Count dragon kills by type from timeline events."""
+    result = {"total_dragons": 0, "elder_count": 0}
+    for dt in DRAGON_TYPES:
+        result[dt.replace("_dragon", "")] = 0
+
+    for e in timeline:
+        if e.get("monsterType") != "dragon":
+            continue
+        result["total_dragons"] += 1
+        sub = e.get("monsterSubtype", "")
+        if sub == "elder_dragon":
+            result["elder_count"] += 1
+        elif sub in DRAGON_TYPES:
+            result[sub.replace("_dragon", "")] += 1
+
+    return result
+
+
+def _extract_teamfights(timeline: list[dict], duration_sec: float) -> dict:
+    """Count teamfights (15s windows with 2+ kills) per phase."""
+    buckets: dict[int, int] = {}
+    for e in timeline:
+        if e.get("eventType") != "champion_kill":
+            continue
+        ts = e.get("timestamp", 0)
+        bucket = floor(ts / 15000)
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    counts = {1: 0, 2: 0, 3: 0}
+    for bucket, kill_count in buckets.items():
+        if kill_count >= 2:
+            phase = _phase(bucket * 15000, duration_sec)
+            counts[phase] += 1
+
+    return {
+        "early_teamfights": counts[1],
+        "mid_teamfights": counts[2],
+        "late_teamfights": counts[3],
+    }
+
+
+def _extract_player_timeline(
+    timeline: list[dict], player_name: str, player_tag: str, duration_sec: float
+) -> dict:
+    """Count kills, deaths, wards per phase for a specific player."""
+    counts = {}
+    for prefix in ("kills", "deaths", "wards"):
+        for phase_name in ("early", "mid", "late"):
+            counts[f"{phase_name}_{prefix}"] = 0
+
+    for e in timeline:
+        ts = e.get("timestamp", 0)
+        phase = _phase(ts, duration_sec)
+        phase_name = {1: "early", 2: "mid", 3: "late"}[phase]
+        etype = e.get("eventType")
+
+        if etype == "champion_kill":
+            if e.get("riotUserName") == player_name and e.get("riotTagLine") == player_tag:
+                counts[f"{phase_name}_kills"] += 1
+            if e.get("victimRiotUserName") == player_name and e.get("victimRiotTagLine") == player_tag:
+                counts[f"{phase_name}_deaths"] += 1
+        elif etype == "ward_placed":
+            if e.get("riotUserName") == player_name and e.get("riotTagLine") == player_tag:
+                counts[f"{phase_name}_wards"] += 1
+
+    return counts
+
+
+def extract_features(docs: list[str]) -> list[dict]:
+    """Parse raw match JSON strings and expand to per-player feature rows."""
+    records = []
+
+    for raw_doc in docs:
+        doc = json.loads(raw_doc)
+        match = doc["data"]["match"]
+        summary = match["matchSummary"]
+        hist = match["historicalData"]
+
+        winning_team = match["winningTeam"]
+        duration_sec = summary.get("matchDuration", 1)
+        if duration_sec < 300:
+            continue  # skip remakes
+
+        match_time = summary.get("matchCreationTime", 0)
+        match_id = hist.get("matchId")
+        primary_name = match.get("playerInfo", {}).get("riotUserName")
+        primary_tag = match.get("playerInfo", {}).get("riotTagLine")
+
+        # Build rank lookup
+        rank_lookup = {}
+        for r in match.get("allPlayerRanks", []) or []:
+            key = f"{r['riotUserName']}#{r['riotTagLine']}"
+            solo = None
+            for s in r.get("rankScores", []) or []:
+                if s.get("queueType") == "ranked_solo_5x5":
+                    solo = s
+                    break
+            if solo is None and r.get("rankScores"):
+                solo = r["rankScores"][0]
+            if solo:
+                rank_lookup[key] = {"tier": solo.get("tier"), "lp": solo.get("lp", 0)}
+
+        # Build performance score lookup
+        perf_lookup = {}
+        for ps in match.get("performanceScore", []) or []:
+            key = f"{ps['riotUserName']}#{ps['riotTagLine']}"
+            perf_lookup[key] = ps
+
+        # Team objectives
+        t1 = hist.get("teamOneOverview", {}) or {}
+        t2 = hist.get("teamTwoOverview", {}) or {}
+
+        # Timeline (match-level features computed once)
+        timeline = hist.get("timelineData", []) or []
+        dragons = _extract_dragons(timeline)
+        teamfights = _extract_teamfights(timeline, duration_sec)
+
+        # Diff frames (primary player only)
+        cs_diff = _phase_avg(hist.get("csDifferenceFrames", []) or [], duration_sec)
+        gold_diff = _phase_avg(hist.get("goldDifferenceFrames", []) or [], duration_sec)
+        ka_diff = _phase_avg(hist.get("kaDifferenceFrames", []) or [], duration_sec)
+        xp_diff = _phase_avg(hist.get("xpDifferenceFrames", []) or [], duration_sec)
+
+        # Team compositions
+        team_a = summary.get("teamA", []) or []
+        team_b = summary.get("teamB", []) or []
+
+        # Per-player expansion
+        for p in hist.get("postGameData", []) or []:
+            pkey = f"{p['riotUserName']}#{p['riotTagLine']}"
+            rank_info = rank_lookup.get(pkey, {"tier": None, "lp": 0})
+            perf = perf_lookup.get(pkey, {})
+            is_primary = (p["riotUserName"] == primary_name and p["riotTagLine"] == primary_tag)
+
+            # Team objectives for this player's team
+            team_obj = t1 if p["teamId"] == 100 else t2
+
+            # Player timeline
+            player_tl = _extract_player_timeline(
+                timeline, p["riotUserName"], p["riotTagLine"], duration_sec
+            )
+
+            # Items
+            items = p.get("items", []) or []
+            item_dict = {f"item{i}": (items[i] if i < len(items) else 0) for i in range(7)}
+
+            # Spells
+            spells = p.get("summonerSpells", []) or []
+            spell_dict = {
+                "spell0": spells[0] if len(spells) > 0 else 0,
+                "spell1": spells[1] if len(spells) > 1 else 0,
+            }
+
+            record = {
+                # Match identifiers
+                "matchId": match_id,
+                "matchDurationSec": duration_sec,
+                "winningTeam": winning_team,
+                "matchCreationTime": match_time,
+                "primaryUserName": primary_name,
+                "primaryTagLine": primary_tag,
+                # Player stats
+                "riotUserName": p["riotUserName"],
+                "riotTagLine": p["riotTagLine"],
+                "championId": p.get("championId"),
+                "teamId": p["teamId"],
+                "role": p.get("role"),
+                "kills": p.get("kills", 0),
+                "deaths": p.get("deaths", 0),
+                "assists": p.get("assists", 0),
+                "cs": p.get("cs", 0),
+                "jungleCs": p.get("jungleCs", 0),
+                "damage": p.get("damage", 0),
+                "damageTaken": p.get("damageTaken", 0),
+                "gold": p.get("gold", 0),
+                "level": p.get("level", 1),
+                "wardsPlaced": p.get("wardsPlaced", 0),
+                "carryPercentage": p.get("carryPercentage", 0),
+                **item_dict,
+                **spell_dict,
+                "keystone": p.get("keystone"),
+                "subStyle": p.get("subStyle"),
+                # Rank
+                "rank_tier": rank_info.get("tier"),
+                "rank_lp": rank_info.get("lp", 0),
+                # Performance scores
+                "hardCarry": perf.get("hardCarry"),
+                "teamplay": perf.get("teamplay"),
+                "damageShareTotal": perf.get("damageShareTotal"),
+                "goldShareTotal": perf.get("goldShareTotal"),
+                "killParticipationTotal": perf.get("killParticipationTotal"),
+                "visionScoreTotal": perf.get("visionScoreTotal"),
+                "finalLvlDiffTotal": perf.get("finalLvlDiffTotal"),
+                # Team objectives
+                "baron_kills": team_obj.get("baronKills", 0),
+                "dragon_kills": team_obj.get("dragonKills", 0),
+                "tower_kills": team_obj.get("towerKills", 0),
+                "inhibitor_kills": team_obj.get("inhibitorKills", 0),
+                "rift_herald_kills": team_obj.get("riftHeraldKills", 0),
+                # Per-player timeline phase aggregates
+                **player_tl,
+                # Dragon features (match-level)
+                **dragons,
+                # Teamfights (match-level)
+                **teamfights,
+                # Diff frame phase averages (primary player only)
+                "cs_diff_early": cs_diff[1] if is_primary else 0,
+                "cs_diff_mid": cs_diff[2] if is_primary else 0,
+                "cs_diff_late": cs_diff[3] if is_primary else 0,
+                "gold_diff_early": gold_diff[1] if is_primary else 0,
+                "gold_diff_mid": gold_diff[2] if is_primary else 0,
+                "gold_diff_late": gold_diff[3] if is_primary else 0,
+                "ka_diff_early": ka_diff[1] if is_primary else 0,
+                "ka_diff_mid": ka_diff[2] if is_primary else 0,
+                "ka_diff_late": ka_diff[3] if is_primary else 0,
+                "xp_diff_early": xp_diff[1] if is_primary else 0,
+                "xp_diff_mid": xp_diff[2] if is_primary else 0,
+                "xp_diff_late": xp_diff[3] if is_primary else 0,
+                # Team compositions (JSON for Python-side champion interaction encoding)
+                "teamA_json": json.dumps(team_a),
+                "teamB_json": json.dumps(team_b),
+            }
+            records.append(record)
+
+    return records
+
+
+def query_features(region: str, limit: int | None = None):
+    """Fetch raw match docs from Synapse and extract per-player features."""
+    import time
     import pandas as pd
     import pymssql
 
-    query = build_query(region)
-    log.info("Querying features for %s...", region)
-    with pymssql.connect(SERVER, USERNAME, PASSWORD, DATABASE) as conn:
-        df = pd.read_sql(query, conn)
-    log.info("Got %d player-rows from %s", len(df), region)
+    query = build_query(region, limit=limit)
+
+    # Retry connection (Synapse serverless pools can be slow to wake)
+    docs = None
+    for attempt in range(3):
+        try:
+            log.info("Querying raw docs for %s (attempt %d)...", region, attempt + 1)
+            with pymssql.connect(SERVER, USERNAME, PASSWORD, DATABASE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                docs = [row[0] for row in cursor]
+            break
+        except Exception as e:
+            if attempt < 2:
+                log.warning("Connection failed, retrying in 5s: %s", e)
+                time.sleep(5)
+            else:
+                raise
+
+    log.info("Got %d matches from %s, extracting features...", len(docs), region)
+    records = extract_features(docs)
+    df = pd.DataFrame(records)
+    log.info("Extracted %d player-rows with %d columns", len(df), len(df.columns))
     return df
 
 

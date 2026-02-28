@@ -1,19 +1,17 @@
-"""XGBoost training pipeline for match outcome prediction.
+"""Logistic regression training pipeline for match outcome prediction.
 
-Replaces the logistic regression model with XGBoost binary:logistic.
 Reads SQL-extracted features from db/scripts/features.py and adds
 Python-side feature engineering:
   - Per-minute rates (kills/deaths/assists/cs/gold/damage/damageTaken/wards)
   - Rank tier encoding (TIER_MAP)
-  - Win/loss streaks (cross-match temporal, same logic as old train.py)
-  - One-hot encoded items (~200 binary), summoner spells (~12), runes (~40)
-  - Champion lane matchup pairs (label-encoded categorical)
-  - Champion teammate synergy pairs (label-encoded categorical)
+  - Win/loss streaks (cross-match temporal)
+  - One-hot encoded items, summoner spells, runes
+  - Champion lane matchup pairs (label-encoded)
+  - Champion teammate synergy pairs (label-encoded)
 
 Exports:
-  - model/{region}.json  – model metadata (type, base_value, accuracy, feature_names)
-  - model/{region}.xgb   – XGBoost model binary
-  - model/{region}_shap.json – precomputed top-6 SHAP values per player-match
+  - model/{region}.json – coefficients, intercept, feature_names, feature_means
+    (frontend computes SHAP inline as coef[i] * (x[i] - mean[i]))
 
 Usage:
     SYNAPSE_PASSWORD=... python model/train_xgb.py [--region na1]
@@ -28,8 +26,9 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 # Add project root so we can import db.scripts.features
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -79,66 +78,10 @@ RANK_FEATURES = [
 
 STREAK_THRESHOLDS = [1, 2, 3, 5, 10]
 
+# Removed dragon_kills, tower_kills, inhibitor_kills (proxies for win/loss)
 OBJECTIVE_FEATURES = [
     ("baron_kills", "Baron Kills"),
-    ("dragon_kills", "Dragon Kills"),
-    ("tower_kills", "Tower Kills"),
-    ("inhibitor_kills", "Inhibitor Kills"),
-    ("rift_herald_kills", "Rift Herald Kills"),
-]
-
-PERFORMANCE_FEATURES = [
-    ("hardCarry", "Hard Carry"),
-    ("teamplay", "Teamplay"),
-    ("damageShareTotal", "Damage Share"),
-    ("goldShareTotal", "Gold Share"),
-    ("killParticipationTotal", "Kill Participation"),
-    ("visionScoreTotal", "Vision Score (perf)"),
-    ("finalLvlDiffTotal", "Level Diff"),
-]
-
-PHASE_FEATURES = [
-    ("early_kills", "Early Kills"),
-    ("mid_kills", "Mid Kills"),
-    ("late_kills", "Late Kills"),
-    ("early_deaths", "Early Deaths"),
-    ("mid_deaths", "Mid Deaths"),
-    ("late_deaths", "Late Deaths"),
-    ("early_wards", "Early Wards"),
-    ("mid_wards", "Mid Wards"),
-    ("late_wards", "Late Wards"),
-]
-
-TEAMFIGHT_FEATURES = [
-    ("early_teamfights", "Early Teamfights"),
-    ("mid_teamfights", "Mid Teamfights"),
-    ("late_teamfights", "Late Teamfights"),
-]
-
-DRAGON_FEATURES = [
-    ("total_dragons", "Total Dragons"),
-    ("elder_count", "Elder Dragons"),
-    ("infernal", "Infernal"),
-    ("mountain", "Mountain"),
-    ("ocean", "Ocean"),
-    ("hextech", "Hextech"),
-    ("chemtech", "Chemtech"),
-    ("cloud", "Cloud"),
-]
-
-DIFF_FEATURES = [
-    ("cs_diff_early", "CS Diff Early"),
-    ("cs_diff_mid", "CS Diff Mid"),
-    ("cs_diff_late", "CS Diff Late"),
-    ("gold_diff_early", "Gold Diff Early"),
-    ("gold_diff_mid", "Gold Diff Mid"),
-    ("gold_diff_late", "Gold Diff Late"),
-    ("ka_diff_early", "KA Diff Early"),
-    ("ka_diff_mid", "KA Diff Mid"),
-    ("ka_diff_late", "KA Diff Late"),
-    ("xp_diff_early", "XP Diff Early"),
-    ("xp_diff_mid", "XP Diff Mid"),
-    ("xp_diff_late", "XP Diff Late"),
+    ("rift_herald_kills", "Rift Herald"),
 ]
 
 
@@ -269,7 +212,7 @@ def add_one_hot_runes(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[s
 def add_champion_interactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """Add champion lane matchup and teammate synergy features (label-encoded categorical)."""
+    """Add champion lane matchup and teammate synergy features (label-encoded)."""
     lane_matchups = []
     synergy_pairs = [[] for _ in range(4)]
 
@@ -344,22 +287,18 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     feature_cols = []
     feature_names = []
 
-    # Per-minute rates
     for _, col, name in PM_RATES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    # Raw stats
     for col, name in RAW_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    # Rank
     for col, name in RANK_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    # Streaks
     for t in STREAK_THRESHOLDS:
         feature_cols.append(f"win_streak_{t}")
         feature_names.append(f"W Streak {t}" if t < 10 else "W Streak 10+")
@@ -367,58 +306,32 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
         feature_cols.append(f"loss_streak_{t}")
         feature_names.append(f"L Streak {t}" if t < 10 else "L Streak 10+")
 
-    # Team objectives
     for col, name in OBJECTIVE_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    # Performance scores
-    for col, name in PERFORMANCE_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    # Phase kills/deaths/wards
-    for col, name in PHASE_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    # Teamfights
-    for col, name in TEAMFIGHT_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    # Dragons
-    for col, name in DRAGON_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    # Diff frames
-    for col, name in DIFF_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    # One-hot items
     feature_cols.extend(item_cols)
     feature_names.extend(item_names)
 
-    # One-hot spells
     feature_cols.extend(spell_cols)
     feature_names.extend(spell_names)
 
-    # One-hot runes
     feature_cols.extend(rune_cols)
     feature_names.extend(rune_names)
 
-    # Champion interactions (categorical)
     feature_cols.extend(champ_cols)
     feature_names.extend(champ_names)
 
     return df, feature_cols, feature_names
 
 
-def train_region(region: str):
-    """Train XGBoost model for a single region."""
-    df = query_features(region)
+def train_region(region: str, parquet_path: str | None = None, limit: int | None = None):
+    """Train logistic regression model for a single region."""
+    if parquet_path:
+        log.info("Loading features from %s", parquet_path)
+        df = pd.read_parquet(parquet_path)
+    else:
+        df = query_features(region, limit=limit)
     log.info("%s: %d raw player-rows", region, len(df))
 
     # Build target variable
@@ -429,109 +342,54 @@ def train_region(region: str):
     log.info("%s: %d features", region, len(feature_cols))
 
     # Prepare X and y
-    X = df[feature_cols].fillna(0).copy()
+    X = df[feature_cols].fillna(0).values.astype(np.float64)
     y = df["win"].values
-
-    # Mark categorical features for XGBoost
-    cat_cols = [c for c in feature_cols if c in ("lane_matchup", "synergy_0", "synergy_1", "synergy_2", "synergy_3")]
-    for c in cat_cols:
-        X[c] = X[c].astype("category")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-    # Train indices for SHAP export later
-    train_idx = X_train.index
-    test_idx = X_test.index
+    # Scale features for logistic regression
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
 
-    model = xgb.XGBClassifier(
-        objective="binary:logistic",
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        enable_categorical=True,
-        tree_method="hist",
-        random_state=42,
-        verbosity=1,
-    )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=20)
+    model = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
+    model.fit(X_train_s, y_train)
 
-    accuracy = model.score(X_test, y_test)
+    accuracy = float(model.score(X_test_s, y_test))
     log.info("%s: accuracy = %.4f", region, accuracy)
 
-    # Save XGBoost model binary
+    # For linear SHAP: coef and mean are in original (unscaled) space
+    # scaled_coef * (x - mean) / std = original_coef * (x - mean)
+    # so original_coef = scaled_coef / std
+    scaled_coefs = model.coef_[0]
+    original_coefs = scaled_coefs / scaler.scale_
+
+    # Export model JSON (frontend computes SHAP inline)
     model_dir = os.path.dirname(__file__)
-    model.save_model(os.path.join(model_dir, f"{region}.xgb"))
-
-    # Compute SHAP values using TreeExplainer
-    log.info("%s: computing SHAP values...", region)
-    import shap
-    explainer = shap.TreeExplainer(model)
-
-    # Compute SHAP for ALL samples (train + test)
-    X_all = pd.concat([X_train, X_test])
-    shap_values = explainer.shap_values(X_all)
-    base_value = float(explainer.expected_value)
-
-    # Build SHAP lookup: matchId -> playerKey -> top-6 SHAP features
-    shap_lookup: dict[str, dict[str, dict]] = {}
-    all_idx = list(train_idx) + list(test_idx)
-
-    for i, idx in enumerate(all_idx):
-        row = df.loc[idx]
-        match_id = str(row["matchId"])
-        player_key = f"{row['riotUserName']}#{row['riotTagLine']}"
-
-        sv = shap_values[i]
-        # Pair with feature names and sort by |shap|
-        pairs = list(zip(feature_names, X_all.iloc[i].values, sv))
-        pairs.sort(key=lambda x: abs(x[2]), reverse=True)
-        top6 = [
-            {"feature": name, "value": float(val), "shapValue": float(shap_val)}
-            for name, val, shap_val in pairs[:6]
-        ]
-
-        if match_id not in shap_lookup:
-            shap_lookup[match_id] = {}
-        shap_lookup[match_id][player_key] = {
-            "baseValue": float(1 / (1 + np.exp(-base_value))),
-            "predictedProbability": float(
-                1 / (1 + np.exp(-(base_value + float(np.sum(sv)))))
-            ),
-            "shapValues": top6,
-        }
-
-    # Save SHAP lookup
-    shap_path = os.path.join(model_dir, f"{region}_shap.json")
-    with open(shap_path, "w") as f:
-        json.dump(shap_lookup, f)
-    log.info("%s: SHAP values saved to %s (%d matches)", region, shap_path, len(shap_lookup))
-
-    # Save model metadata JSON
     meta = {
-        "model_type": "xgboost",
-        "base_value": base_value,
-        "accuracy": round(accuracy, 4),
+        "model_type": "logistic_regression",
+        "intercept": float(model.intercept_[0]),
+        "coefficients": [float(c) for c in original_coefs],
         "feature_names": feature_names,
+        "feature_means": [float(m) for m in scaler.mean_],
+        "accuracy": round(accuracy, 4),
         "n_samples": int(len(X_train)),
         "n_features": len(feature_cols),
     }
     meta_path = os.path.join(model_dir, f"{region}.json")
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-    log.info("%s: model metadata saved to %s", region, meta_path)
+    log.info("%s: model saved to %s", region, meta_path)
 
-    # Sanity checks
-    log.info("  Accuracy: %.4f (vs ~0.80 LR baseline)", accuracy)
+    log.info("  Accuracy: %.4f", accuracy)
     log.info("  Features: %d total", len(feature_cols))
     log.info("  Samples: %d train, %d test", len(X_train), len(X_test))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train XGBoost model")
+    parser = argparse.ArgumentParser(description="Train model")
     parser.add_argument(
         "--region",
         nargs="+",
@@ -539,10 +397,22 @@ if __name__ == "__main__":
         choices=REGIONS,
         help="Region(s) to train",
     )
+    parser.add_argument(
+        "--parquet",
+        type=str,
+        default=None,
+        help="Path to pre-extracted parquet file (skips Synapse query)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of matches from Synapse (for testing)",
+    )
     args = parser.parse_args()
 
     for region in args.region:
         try:
-            train_region(region)
+            train_region(region, parquet_path=args.parquet, limit=args.limit)
         except Exception as e:
             log.error("Failed to train %s: %s", region, e, exc_info=True)
