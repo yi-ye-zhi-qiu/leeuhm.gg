@@ -2,7 +2,7 @@
 
 import sql from "mssql";
 import type { MatchData } from "@/types/match";
-import { lookupShapValues } from "@/lib/shap";
+import { computeShapValues } from "@/lib/shap";
 
 const config: sql.config = {
   user: process.env.SYNAPSE_USER,
@@ -110,6 +110,10 @@ function slim(raw: any): MatchData {
   };
 }
 
+// -- Commented out: expensive blob-scan queries --
+// export async function fetchTierCounts() { ... }
+// export async function fetchTotalCount() { ... }
+
 export async function fetchSynapseData(
   opts: FetchOptions = {}
 ): Promise<{ matches: MatchData[]; hasMore: boolean }> {
@@ -143,13 +147,8 @@ export async function fetchSynapseData(
 
 function attachShapValues(matches: MatchData[]): MatchData[] {
   for (const m of matches) {
-    const ms = m.match.matchSummary;
-    const matchId = String(ms.matchId);
-    const playerKey = `${ms.riotUserName}#${ms.riotTagLine}`;
-
-    m.shapValues =
-      lookupShapValues(matchId, playerKey, ms.regionId) ?? undefined;
+    const regionId = m.match.matchSummary.regionId;
+    m.shapValues = computeShapValues(m, regionId) ?? undefined;
   }
-
   return matches;
 }
