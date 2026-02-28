@@ -146,69 +146,6 @@ def add_streaks(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, streak_df], axis=1)
 
 
-def add_one_hot_items(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """One-hot encode items (item0..item6). Returns df, column names, display names."""
-    item_cols = [f"item{i}" for i in range(7)]
-    all_items = set()
-    for col in item_cols:
-        all_items.update(df[col].dropna().unique())
-    all_items.discard(0)  # item 0 = empty slot
-    all_items = sorted(all_items)
-
-    cols = []
-    names = []
-    for item_id in all_items:
-        col_name = f"item_{item_id}"
-        df[col_name] = 0
-        for ic in item_cols:
-            df[col_name] = df[col_name] | (df[ic] == item_id).astype(int)
-        cols.append(col_name)
-        names.append(f"Item {item_id}")
-
-    return df, cols, names
-
-
-def add_one_hot_spells(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """One-hot encode summoner spells (spell0, spell1)."""
-    all_spells = set()
-    for col in ["spell0", "spell1"]:
-        all_spells.update(df[col].dropna().unique())
-    all_spells.discard(0)
-    all_spells = sorted(all_spells)
-
-    cols = []
-    names = []
-    for spell_id in all_spells:
-        col_name = f"spell_{spell_id}"
-        df[col_name] = ((df["spell0"] == spell_id) | (df["spell1"] == spell_id)).astype(int)
-        cols.append(col_name)
-        names.append(f"Spell {spell_id}")
-
-    return df, cols, names
-
-
-def add_one_hot_runes(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """One-hot encode keystone and subStyle runes."""
-    all_keystones = sorted(df["keystone"].dropna().unique())
-    all_substyles = sorted(df["subStyle"].dropna().unique())
-
-    cols = []
-    names = []
-    for ks in all_keystones:
-        col_name = f"ks_{int(ks)}"
-        df[col_name] = (df["keystone"] == ks).astype(int)
-        cols.append(col_name)
-        names.append(f"Keystone {int(ks)}")
-
-    for ss in all_substyles:
-        col_name = f"ss_{int(ss)}"
-        df[col_name] = (df["subStyle"] == ss).astype(int)
-        cols.append(col_name)
-        names.append(f"SubStyle {int(ss)}")
-
-    return df, cols, names
-
-
 def add_champion_interactions(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -278,9 +215,6 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     df = add_per_minute_rates(df)
     df = add_rank_encoding(df)
     df = add_streaks(df)
-    df, item_cols, item_names = add_one_hot_items(df)
-    df, spell_cols, spell_names = add_one_hot_spells(df)
-    df, rune_cols, rune_names = add_one_hot_runes(df)
     df, champ_cols, champ_names = add_champion_interactions(df)
 
     # Assemble feature columns and display names in order
@@ -309,15 +243,6 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     for col, name in OBJECTIVE_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
-
-    feature_cols.extend(item_cols)
-    feature_names.extend(item_names)
-
-    feature_cols.extend(spell_cols)
-    feature_names.extend(spell_names)
-
-    feature_cols.extend(rune_cols)
-    feature_names.extend(rune_names)
 
     feature_cols.extend(champ_cols)
     feature_names.extend(champ_names)
