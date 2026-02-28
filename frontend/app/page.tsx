@@ -1,7 +1,8 @@
 import Image from "next/image";
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, Github } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 export default function HomePage() {
   return (
@@ -26,6 +27,17 @@ export default function HomePage() {
             How public data can help gamers know why they lost via SHAP-powered
             win probability breakdowns.
           </h3>
+          <Button variant="outline" className="w-fit" asChild>
+            <a
+              href="https://github.com/yi-ye-zhi-qiu/leeuhm.gg"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <Github className="h-4 w-4" />
+              Source code
+            </a>
+          </Button>
+
           <div className="mt-4 rounded-lg border bg-card p-4 text-sm text-muted-foreground">
             <p>
               Created by Liam Isaacs as part of{" "}
