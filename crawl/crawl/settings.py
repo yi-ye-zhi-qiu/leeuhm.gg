@@ -4,7 +4,7 @@ LOG_LEVEL = "INFO"
 RETRY_ENABLED = False
 COOKIES_ENABLED = False
 SPIDER_MODULES = ["crawl.spiders"]
-CONCURRENT_REQUESTS = 64
+CONCURRENT_REQUESTS = 128
 DOWNLOADER_MIDDLEWARES = {
     "crawl.middlewares.Proxy": 100,
     "crawl.middlewares.Impersonate": 200,
@@ -12,13 +12,18 @@ DOWNLOADER_MIDDLEWARES = {
 ITEM_PIPELINES = {
     "crawl.pipelines.RecordCrawledAt": 100,
 }
+EXTENSIONS = {
+    "scrapy.extensions.feedexport.FeedExporter": None,
+    "crawl.extensions.ImmediateFeedExporter": 0,
+}
 REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
 DOWNLOADER_CLIENT_TLS_METHOD = "TLSv1.2"
-DOWNLOAD_HANDLERS = {
-    "http": "scrapy_impersonate.ImpersonateDownloadHandler",
-    "https": "scrapy_impersonate.ImpersonateDownloadHandler",
-}
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+# DOWNLOAD_HANDLERS = {
+#     "http": "scrapy_impersonate.ImpersonateDownloadHandler",
+#     "https": "scrapy_impersonate.ImpersonateDownloadHandler",
+# }
+USER_AGENT = "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36"
+# TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 FEEDS = {
     os.path.join(
         "azure://",  # upload to Azure
@@ -33,7 +38,7 @@ FEEDS = {
         "store_empty": False,
         "postprocessing": ["crawl.postprocessing.GzipPlugin"],
         "gzip_compresslevel": 9,
-        "batch_item_count": 150,  # every X summoner pages
+        "batch_item_count": 150,  # every X games
     }
 }
 FEED_STORAGES = {"azure": "crawl.utils.feeds.AzureFeedStorage"}

@@ -1,21 +1,22 @@
 import os
 import random
 
+PROXY_NETWORK = os.getenv("PROXY_NETWORK", "")
+
 
 class Proxy:
     """A middleware to use a proxy url."""
 
     def process_request(self, request, spider):
-        if not request.meta.get("proxy", None):
-            proxy_network = os.getenv("PROXY_NETWORK", None)
-            if proxy_network:
-                proxy_network = proxy_network.format(session_id=random.getrandbits(256))
-            request.meta["proxy"] = proxy_network
+        if not request.meta.get("proxy", None) and PROXY_NETWORK:
+            request.meta["proxy"] = PROXY_NETWORK.format(
+                session=random.getrandbits(256)
+            )
 
 
 class Impersonate:
-    """A middleware to impersonate a browser"""
+    """A middleware to impersonate a browser."""
 
     def process_request(self, request, spider):
-        if not request.meta.get("impersonate", None):
-            request.meta["impersonate"] = "chrome124"
+        # request.meta.setdefault("impersonate", "chrome")
+        return None

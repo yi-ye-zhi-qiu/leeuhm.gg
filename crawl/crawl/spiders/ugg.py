@@ -51,6 +51,7 @@ class CrawlGameData(Spider):
         self,
         REGION: Literal["na", "euw", "kr"],  # eun, oce, ...
         N_LEADERBOARD_PAGES: Optional[int] = 7500,  # This goes to Bronze 1 about
+        N_LEADERBOARD_PAGES_START_INDEX: Optional[int] = 1,
         N_USER_ITER: Optional[int] = 1,
         *args,
         **kwargs,
@@ -70,10 +71,13 @@ class CrawlGameData(Spider):
         # in the case of a null value: ....../euw/None/...
         self.feeds_partition = REGION
         self.n_leaderboard_pages = int(N_LEADERBOARD_PAGES)
+        self.n_leaderboard_pages_start_index = int(N_LEADERBOARD_PAGES_START_INDEX)
         self.n_user_iter = int(N_USER_ITER)
 
     def start_requests(self) -> Iterable[JsonRequest]:
-        for page_index in range(1, self.n_leaderboard_pages + 1):
+        for page_index in range(
+            self.n_leaderboard_pages_start_index, self.n_leaderboard_pages + 1
+        ):
             yield self._leaderboard_api(page_index=page_index)
 
     def _leaderboard_api(self, page_index=1) -> JsonRequest:
@@ -99,6 +103,7 @@ class CrawlGameData(Spider):
                 "query": "query getRankedLeaderboard($page: Int, $queueType: Int, $regionId: String!) {\n  leaderboardPage(page: $page, queueType: $queueType, regionId: $regionId) {\n    totalPlayerCount\n    topPlayerMostPlayedChamp\n    players {\n      iconId\n      losses\n      lp\n      overallRanking\n      rank\n      summonerLevel\n      riotTagLine\n      riotUserName\n      tier\n      wins\n      __typename\n    }\n    __typename\n  }\n}",
             },
             cb_kwargs={"page_index": page_index},
+            meta={"impersonate": "chrome133a"},
         )
 
     def _match_summary_api(
