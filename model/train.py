@@ -1,36 +1,41 @@
-"""
-Train per-region logistic regression models for SHAP force plots.
+"""Logistic regression training pipeline for match outcome prediction.
 
-Features (per player per match):
-  - Per-minute rates: kills, deaths, assists, CS, gold, damage, damageTaken, wards
-  - Raw: visionScore, level, carryPercentage
-  - Rank: tier (numeric 1-8), LP
-  - Momentum: win/loss streak indicators (last 1, 2, 3, 5, 10+ games)
+Reads SQL-extracted features from db/scripts/features.py and adds
+Python-side feature engineering:
+  - Per-minute rates (kills/deaths/assists/cs/gold/damage/damageTaken/wards)
+  - Rank tier encoding (TIER_MAP)
+  - Win/loss streaks (cross-match temporal)
+  - One-hot encoded items, summoner spells, runes
+  - Champion lane matchup pairs (label-encoded)
+  - Champion teammate synergy pairs (label-encoded)
+
+Exports:
+  - model/{region}.json – coefficients, intercept, feature_names, feature_means
+    (frontend computes SHAP inline as coef[i] * (x[i] - mean[i]))
 
 Usage:
-    SYNAPSE_PASSWORD=... python model/train.py
+    SYNAPSE_PASSWORD=... python model/train_xgb.py [--region na1]
 """
 
 import os
+import sys
 import json
+import argparse
 import logging
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import pymssql
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# Add project root so we can import db.scripts.features
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from db.scripts.features import query_features
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
-
-SERVER = os.environ.get(
-    "SYNAPSE_ENDPOINT", "crawlsynapse-ws-ondemand.sql.azuresynapse.net"
-)
-DATABASE = "crawldb"
-USERNAME = os.environ.get("SYNAPSE_USER", "sqladmin")
-PASSWORD = os.environ["SYNAPSE_PASSWORD"]
 
 REGIONS = ["na1", "euw1", "kr"]
 
@@ -47,233 +52,332 @@ TIER_MAP = {
     "CHALLENGER": 8,
 }
 
-FEATURE_COLS = [
-    "kills_pm",
-    "deaths_pm",
-    "assists_pm",
-    "cs_pm",
-    "gold_pm",
-    "damage_pm",
-    "damageTaken_pm",
-    "wardsPlaced_pm",
-    "visionScore",
-    "level",
-    "carryPercentage",
-    "rank_tier",
-    "lp",
-    "win_streak_1",
-    "win_streak_2",
-    "win_streak_3",
-    "win_streak_5",
-    "win_streak_10",
-    "loss_streak_1",
-    "loss_streak_2",
-    "loss_streak_3",
-    "loss_streak_5",
-    "loss_streak_10",
+# Per-minute rate columns: (source_col, output_name, display_name)
+PM_RATES = [
+    ("damageTaken", "damageTaken_pm", "Dmg Taken/min"),
+    ("wardsPlaced", "wardsPlaced_pm", "Wards/min"),
 ]
 
-FEATURE_NAMES = [
-    "Kills/min",
-    "Deaths/min",
-    "Assists/min",
-    "CS/min",
-    "Gold/min",
-    "Damage/min",
-    "Dmg Taken/min",
-    "Wards/min",
-    "Vision Score",
-    "Level",
-    "Carry %",
-    "Rank",
-    "LP",
-    "W Streak 1",
-    "W Streak 2",
-    "W Streak 3",
-    "W Streak 5",
-    "W Streak 10+",
-    "L Streak 1",
-    "L Streak 2",
-    "L Streak 3",
-    "L Streak 5",
-    "L Streak 10+",
+# Raw SQL columns used directly as features
+RAW_FEATURES = [
+    ("visionScoreTotal", "Vision Score"),
 ]
 
+RANK_FEATURES = [
+    ("rank_tier_num", "Rank"),
+]
 
-def query_region(region: str) -> pd.DataFrame:
-    query = f"""
-    SELECT *
-    FROM OPENROWSET(
-        BULK 'teemo/0.0.0/{region}/*.jsonl.gz',
-        DATA_SOURCE = 'CrawlStorage',
-        FORMAT = 'CSV',
-        FIELDTERMINATOR = '0x0b',
-        FIELDQUOTE = '0x0b',
-        ROWTERMINATOR = '0x0a'
-    ) WITH (doc NVARCHAR(MAX)) AS r
-    WHERE JSON_VALUE(doc, '$.data.match.winningTeam') IS NOT NULL
-    """
-    log.info(f"Querying {region}...")
-    with pymssql.connect(SERVER, USERNAME, PASSWORD, DATABASE) as conn:
-        rows = pd.read_sql(query, conn)
-    log.info(f"Got {len(rows)} matches from {region}")
-    return rows
+STREAK_THRESHOLD = 2
+
+OBJECTIVE_FEATURES = []
+
+PERFORMANCE_FEATURES = [
+    ("teamplay", "Teamplay"),
+    ("damageShareTotal", "Damage Share"),
+    ("goldShareTotal", "Gold Share"),
+    ("killParticipationTotal", "Kill Participation"),
+    ("visionScoreTotal", "Vision Score (perf)"),
+    ("finalLvlDiffTotal", "Level Diff"),
+]
+
+# Removed late_deaths (proxy for win/loss)
+PHASE_FEATURES = [
+    ("early_kills", "Early Kills"),
+    ("mid_kills", "Mid Kills"),
+    ("late_kills", "Late Kills"),
+    ("early_deaths", "Early Deaths"),
+    ("mid_deaths", "Mid Deaths"),
+    ("early_wards", "Early Wards"),
+    ("mid_wards", "Mid Wards"),
+    ("late_wards", "Late Wards"),
+]
+
+TEAMFIGHT_FEATURES = [
+    ("early_teamfights", "Early Teamfights"),
+    ("mid_teamfights", "Mid Teamfights"),
+    ("late_teamfights", "Late Teamfights"),
+]
+
+DIFF_FEATURES = [
+    ("cs_diff_early", "CS Diff Early"),
+    ("cs_diff_mid", "CS Diff Mid"),
+    ("cs_diff_late", "CS Diff Late"),
+    ("gold_diff_early", "Gold Diff Early"),
+    ("gold_diff_mid", "Gold Diff Mid"),
+    ("gold_diff_late", "Gold Diff Late"),
+    ("ka_diff_early", "KA Diff Early"),
+    ("ka_diff_mid", "KA Diff Mid"),
+    ("ka_diff_late", "KA Diff Late"),
+    ("xp_diff_early", "XP Diff Early"),
+    ("xp_diff_mid", "XP Diff Mid"),
+    ("xp_diff_late", "XP Diff Late"),
+]
 
 
 def compute_streaks(results: list[bool]) -> dict:
     """Given a list of win/loss booleans (oldest first), return streak indicators."""
     n = len(results)
-    streaks = {}
-    for threshold in [1, 2, 3, 5, 10]:
-        if n >= threshold:
-            recent = results[-threshold:]
-            streaks[f"win_streak_{threshold}"] = 1 if all(recent) else 0
-            streaks[f"loss_streak_{threshold}"] = 1 if not any(recent) else 0
+    if n >= STREAK_THRESHOLD:
+        recent = results[-STREAK_THRESHOLD:]
+        return {
+            "win_streak": 1 if all(recent) else 0,
+            "loss_streak": 1 if not any(recent) else 0,
+        }
+    return {"win_streak": 0, "loss_streak": 0}
+
+
+def add_per_minute_rates(df: pd.DataFrame) -> pd.DataFrame:
+    """Add per-minute rate columns."""
+    dm = df["matchDurationSec"] / 60.0
+    for src, out, _ in PM_RATES:
+        if src == "cs":
+            df[out] = (df["cs"].fillna(0) + df["jungleCs"].fillna(0)) / dm
         else:
-            streaks[f"win_streak_{threshold}"] = 0
-            streaks[f"loss_streak_{threshold}"] = 0
-    return streaks
+            df[out] = df[src].fillna(0) / dm
+    return df
 
 
-def extract_features(rows: pd.DataFrame) -> pd.DataFrame:
-    # First pass: collect per-player match history for streak computation
+def add_rank_encoding(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode rank tier as numeric."""
+    df["rank_tier_num"] = df["rank_tier"].map(
+        lambda t: TIER_MAP.get(str(t).upper(), 4) if pd.notna(t) else 4
+    )
+    df["rank_lp"] = df["rank_lp"].fillna(0)
+    return df
+
+
+def add_streaks(df: pd.DataFrame) -> pd.DataFrame:
+    """Add win/loss streak features via cross-match temporal computation."""
     player_history: dict[str, list[tuple[int, bool]]] = defaultdict(list)
-    parsed_matches = []
 
-    for _, row in rows.iterrows():
-        doc = json.loads(row["doc"])
-        match = doc["data"]["match"]
-        winning_team = match["winningTeam"]
-        match_time = match["matchSummary"].get("matchCreationTime", 0)
-        duration_sec = match["matchSummary"].get("matchDuration", 1)
-        duration_min = duration_sec / 60.0
+    # First pass: collect history
+    for _, row in df.iterrows():
+        pkey = f"{row['riotUserName']}#{row['riotTagLine']}"
+        won = row["teamId"] == row["winningTeam"]
+        player_history[pkey].append((row["matchCreationTime"], won))
 
-        if duration_min < 5:  # skip remakes
-            continue
-
-        post_game = match["historicalData"]["postGameData"]
-        ranks_list = match.get("allPlayerRanks", [])
-
-        # Build rank lookup
-        rank_lookup = {}
-        for r in ranks_list:
-            key = f"{r['riotUserName']}#{r['riotTagLine']}"
-            solo = None
-            for s in r.get("rankScores", []):
-                if s.get("queueType") == "ranked_solo_5x5":
-                    solo = s
-                    break
-            if solo is None and r.get("rankScores"):
-                solo = r["rankScores"][0]
-            if solo:
-                rank_lookup[key] = {
-                    "tier": TIER_MAP.get(solo["tier"].upper(), 4),
-                    "lp": solo.get("lp", 0),
-                }
-
-        parsed_matches.append(
-            {
-                "match_time": match_time,
-                "duration_min": duration_min,
-                "winning_team": winning_team,
-                "post_game": post_game,
-                "rank_lookup": rank_lookup,
-            }
-        )
-
-        # Record each player's result for streak tracking
-        for p in post_game:
-            pkey = f"{p['riotUserName']}#{p['riotTagLine']}"
-            won = p["teamId"] == winning_team
-            player_history[pkey].append((match_time, won))
-
-    # Sort each player's history by time
+    # Sort each player's history
     for pkey in player_history:
         player_history[pkey].sort(key=lambda x: x[0])
 
-    # Second pass: extract features with streak context
-    records = []
-    for m in parsed_matches:
-        for p in m["post_game"]:
-            pkey = f"{p['riotUserName']}#{p['riotTagLine']}"
-            rank_info = m["rank_lookup"].get(pkey, {"tier": 4, "lp": 0})
-            dm = m["duration_min"]
+    # Second pass: compute streaks for each row
+    streak_records = []
+    for _, row in df.iterrows():
+        pkey = f"{row['riotUserName']}#{row['riotTagLine']}"
+        history = player_history[pkey]
+        preceding = [won for t, won in history if t < row["matchCreationTime"]]
+        streak_records.append(compute_streaks(preceding))
 
-            # Compute streak features from this player's history
-            history = player_history[pkey]
-            preceding_results = [
-                won for t, won in history if t < m["match_time"]
-            ]
-            streaks = compute_streaks(preceding_results)
-
-            record = {
-                "kills_pm": p["kills"] / dm,
-                "deaths_pm": p["deaths"] / dm,
-                "assists_pm": p["assists"] / dm,
-                "cs_pm": (p["cs"] + p.get("jungleCs", 0)) / dm,
-                "gold_pm": p["gold"] / dm,
-                "damage_pm": p["damage"] / dm,
-                "damageTaken_pm": p.get("damageTaken", 0) / dm,
-                "wardsPlaced_pm": p.get("wardsPlaced", 0) / dm,
-                "visionScore": p.get("visionScore", 0),
-                "level": p["level"],
-                "carryPercentage": p.get("carryPercentage", 0),
-                "rank_tier": rank_info["tier"],
-                "lp": rank_info["lp"],
-                **streaks,
-                "win": 1 if p["teamId"] == m["winning_team"] else 0,
-            }
-            records.append(record)
-
-    return pd.DataFrame(records)
+    streak_df = pd.DataFrame(streak_records, index=df.index)
+    return pd.concat([df, streak_df], axis=1)
 
 
-def train_region(region: str):
-    rows = query_region(region)
-    df = extract_features(rows)
-    log.info(f"{region}: {len(df)} player-rows extracted")
+def add_champion_interactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Add champion lane matchup and teammate synergy features (label-encoded)."""
+    lane_matchups = []
+    synergy_pairs = [[] for _ in range(4)]
 
-    X = df[FEATURE_COLS].fillna(0).values
+    for _, row in df.iterrows():
+        team_a = json.loads(row["teamA_json"]) if isinstance(row["teamA_json"], str) else row["teamA_json"]
+        team_b = json.loads(row["teamB_json"]) if isinstance(row["teamB_json"], str) else row["teamB_json"]
+
+        if not team_a or not team_b:
+            lane_matchups.append(None)
+            for s in synergy_pairs:
+                s.append(None)
+            continue
+
+        # Determine which team this player is on
+        player_team = team_a if row["teamId"] == team_a[0].get("teamId", 100) else team_b
+        enemy_team = team_b if player_team is team_a else team_a
+
+        # Build role->champion maps
+        player_role_map = {m["role"]: m["championId"] for m in player_team}
+        enemy_role_map = {m["role"]: m["championId"] for m in enemy_team}
+
+        # Lane matchup: player's champion vs enemy in same role
+        player_champ = row["championId"]
+        enemy_champ = enemy_role_map.get(row["role"])
+        if enemy_champ:
+            matchup = f"{min(player_champ, enemy_champ)}_{max(player_champ, enemy_champ)}"
+        else:
+            matchup = None
+        lane_matchups.append(matchup)
+
+        # Teammate synergies: pair with each of the other 4 teammates (sorted by role)
+        teammates = sorted(
+            [m for m in player_team if m["championId"] != player_champ],
+            key=lambda m: m["role"],
+        )
+        for i in range(4):
+            if i < len(teammates):
+                tc = teammates[i]["championId"]
+                pair = f"{min(player_champ, tc)}_{max(player_champ, tc)}"
+                synergy_pairs[i].append(pair)
+            else:
+                synergy_pairs[i].append(None)
+
+    # Label-encode
+    df["lane_matchup"] = pd.Categorical(lane_matchups).codes
+    cols = ["lane_matchup"]
+    names = ["Lane Matchup"]
+
+    for i in range(4):
+        col = f"synergy_{i}"
+        df[col] = pd.Categorical(synergy_pairs[i]).codes
+        cols.append(col)
+        names.append(f"Synergy {i}")
+
+    return df, cols, names
+
+
+def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    Build the full feature matrix from the SQL-extracted DataFrame.
+    Returns (X_df, feature_col_names, feature_display_names).
+    """
+    df = add_per_minute_rates(df)
+    df = add_rank_encoding(df)
+    df = add_streaks(df)
+    df, champ_cols, champ_names = add_champion_interactions(df)
+
+    # Assemble feature columns and display names in order
+    feature_cols = []
+    feature_names = []
+
+    for _, col, name in PM_RATES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in RAW_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in RANK_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    feature_cols.append("win_streak")
+    feature_names.append("Win Streak")
+    feature_cols.append("loss_streak")
+    feature_names.append("Loss Streak")
+
+    for col, name in OBJECTIVE_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in PERFORMANCE_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in PHASE_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in TEAMFIGHT_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in DIFF_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    feature_cols.extend(champ_cols)
+    feature_names.extend(champ_names)
+
+    return df, feature_cols, feature_names
+
+
+def train_region(region: str, parquet_path: str | None = None, limit: int | None = None):
+    """Train logistic regression model for a single region."""
+    if parquet_path:
+        log.info("Loading features from %s", parquet_path)
+        df = pd.read_parquet(parquet_path)
+    else:
+        df = query_features(region, limit=limit)
+    log.info("%s: %d raw player-rows", region, len(df))
+
+    # Build target variable
+    df["win"] = (df["teamId"] == df["winningTeam"]).astype(int)
+
+    # Build feature matrix
+    df, feature_cols, feature_names = build_feature_matrix(df)
+    log.info("%s: %d features", region, len(feature_cols))
+
+    # Prepare X and y
+    X = df[feature_cols].fillna(0).values.astype(np.float64)
     y = df["win"].values
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-    model = LogisticRegression(
-        penalty="l2", solver="liblinear", max_iter=1000, C=0.1
-    )
-    model.fit(X_train, y_train)
+    # Scale features for logistic regression
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
 
-    accuracy = model.score(X_test, y_test)
-    log.info(f"{region}: accuracy = {accuracy:.4f}")
+    model = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
+    model.fit(X_train_s, y_train)
 
-    output = {
-        "feature_names": FEATURE_NAMES,
-        "coefficients": model.coef_[0].tolist(),
+    accuracy = float(model.score(X_test_s, y_test))
+    log.info("%s: accuracy = %.4f", region, accuracy)
+
+    # For linear SHAP: coef and mean are in original (unscaled) space
+    # scaled_coef * (x - mean) / std = original_coef * (x - mean)
+    # so original_coef = scaled_coef / std
+    scaled_coefs = model.coef_[0]
+    original_coefs = scaled_coefs / scaler.scale_
+
+    # Export model JSON (frontend computes SHAP inline)
+    model_dir = os.path.dirname(__file__)
+    meta = {
+        "model_type": "logistic_regression",
         "intercept": float(model.intercept_[0]),
-        "feature_means": X_train.mean(axis=0).tolist(),
-        "n_samples": int(len(X_train)),
+        "coefficients": [float(c) for c in original_coefs],
+        "feature_names": feature_names,
+        "feature_means": [float(m) for m in scaler.mean_],
         "accuracy": round(accuracy, 4),
+        "n_samples": int(len(X_train)),
+        "n_features": len(feature_cols),
     }
+    meta_path = os.path.join(model_dir, f"{region}.json")
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    log.info("%s: model saved to %s", region, meta_path)
 
-    output_path = os.path.join(os.path.dirname(__file__), f"{region}.json")
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2)
-    log.info(f"{region}: model saved to {output_path}")
-
-    # Sanity checks
-    coef_dict = dict(zip(FEATURE_NAMES, model.coef_[0]))
-    log.info(f"  Kills/min coef: {coef_dict['Kills/min']:+.4f} (expect positive)")
-    log.info(f"  Deaths/min coef: {coef_dict['Deaths/min']:+.4f} (expect negative)")
-    log.info(f"  LP coef: {coef_dict['LP']:+.4f}")
-    for s in ["W Streak 3", "L Streak 3"]:
-        log.info(f"  {s} coef: {coef_dict[s]:+.4f}")
+    log.info("  Accuracy: %.4f", accuracy)
+    log.info("  Features: %d total", len(feature_cols))
+    log.info("  Samples: %d train, %d test", len(X_train), len(X_test))
 
 
 if __name__ == "__main__":
-    for region in REGIONS:
+    parser = argparse.ArgumentParser(description="Train model")
+    parser.add_argument(
+        "--region",
+        nargs="+",
+        default=REGIONS,
+        choices=REGIONS,
+        help="Region(s) to train",
+    )
+    parser.add_argument(
+        "--parquet",
+        type=str,
+        default=None,
+        help="Path to pre-extracted parquet file (skips Synapse query)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit number of matches from Synapse (for testing)",
+    )
+    args = parser.parse_args()
+
+    for region in args.region:
         try:
-            train_region(region)
+            train_region(region, parquet_path=args.parquet, limit=args.limit)
         except Exception as e:
-            log.error(f"Failed to train {region}: {e}", exc_info=True)
+            log.error("Failed to train %s: %s", region, e, exc_info=True)

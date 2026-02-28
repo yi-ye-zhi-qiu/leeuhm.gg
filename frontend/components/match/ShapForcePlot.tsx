@@ -3,6 +3,20 @@
 import { useState } from "react";
 import type { ShapResult } from "@/types/match";
 
+function getTag(win: boolean, confidence: number): string {
+  if (win) {
+    if (confidence >= 80) return "Dominant";
+    if (confidence >= 60) return "Expected";
+    if (confidence >= 50) return "Close";
+    return "Surprising";
+  } else {
+    if (confidence >= 80) return "Outclassed";
+    if (confidence >= 60) return "Expected";
+    if (confidence >= 50) return "Close";
+    return "Surprising";
+  }
+}
+
 const VB_W = 200;
 const VB_H = 14;
 const TIP = 4;
@@ -20,13 +34,11 @@ export function WFactor({
 
   const pct = Math.round(shap.predictedProbability * 100);
   const clampedPct = Math.max(10, Math.min(90, pct));
+  // Confidence: how far from 50% the prediction is, mapped to the winning side
+  const confidence = win ? pct : 100 - pct;
+  const tag = getTag(win, confidence);
 
   const top = shap.shapValues.slice(0, 6);
-
-  // Top contributing feature (largest absolute SHAP value)
-  const topFeature = top.length > 0
-    ? top.reduce((best, s) => Math.abs(s.shapValue) > Math.abs(best.shapValue) ? s : best)
-    : null;
 
   const helped = top
     .filter((s) => s.shapValue > 0)
@@ -123,9 +135,9 @@ export function WFactor({
 
   return (
     <div className="flex flex-1 flex-col gap-0.5 min-w-0">
-      {/* Hovered feature label — positioned above bar */}
+      {/* Confidence label or hovered feature — above bar */}
       <div className="relative h-3">
-        {hoveredPoly && (
+        {hoveredPoly ? (
           <span
             className="absolute text-[9px] font-medium whitespace-nowrap text-foreground"
             style={{
@@ -138,6 +150,16 @@ export function WFactor({
               {hoveredPoly.value > 0 ? "+" : ""}
               {hoveredPoly.value.toFixed(2)}
             </span>
+          </span>
+        ) : (
+          <span
+            className="absolute text-[9px] text-muted-foreground whitespace-nowrap"
+            style={{
+              left: `${clampedPct}%`,
+              transform: "translateX(-50%)",
+            }}
+          >
+            Predicted {win ? "win" : "loss"} · {confidence}%
           </span>
         )}
       </div>
@@ -178,20 +200,18 @@ export function WFactor({
         ))}
       </svg>
 
-      {/* Top feature — positioned at meeting point, below bar */}
-      {topFeature && (
-        <div className="relative h-3.5">
-          <span
-            className="absolute rounded-sm border bg-muted/50 px-1 py-px text-[8px] font-medium text-muted-foreground whitespace-nowrap"
-            style={{
-              left: `${clampedPct}%`,
-              transform: "translateX(-50%)",
-            }}
-          >
-            {topFeature.feature}
-          </span>
-        </div>
-      )}
+      {/* Tag — positioned at meeting point, below bar */}
+      <div className="relative h-3.5">
+        <span
+          className="absolute rounded-sm border bg-muted/50 px-1 py-px text-[8px] font-medium text-muted-foreground whitespace-nowrap"
+          style={{
+            left: `${clampedPct}%`,
+            transform: "translateX(-50%)",
+          }}
+        >
+          {tag}
+        </span>
+      </div>
     </div>
   );
 }
