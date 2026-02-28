@@ -107,37 +107,6 @@ function extractFeatures(
   fv["baron_kills"] = teamObj?.baronKills ?? 0;
   fv["rift_herald_kills"] = teamObj?.riftHeraldKills ?? 0;
 
-  // Items (one-hot)
-  const items = pgd?.items ?? ms.items ?? [];
-  for (const name of model.feature_names) {
-    if (name.startsWith("Item ")) {
-      const itemId = parseInt(name.replace("Item ", ""));
-      fv[`item_${itemId}`] = items.includes(itemId) ? 1 : 0;
-    }
-  }
-
-  // Spells (one-hot)
-  const spells = pgd?.summonerSpells ?? ms.summonerSpells ?? [];
-  for (const name of model.feature_names) {
-    if (name.startsWith("Spell ")) {
-      const spellId = parseInt(name.replace("Spell ", ""));
-      fv[`spell_${spellId}`] = spells.includes(spellId) ? 1 : 0;
-    }
-  }
-
-  // Runes (one-hot)
-  const keystone = pgd?.keystone ?? ms.runes?.[0] ?? 0;
-  const subStyle = pgd?.subStyle ?? ms.subStyle ?? 0;
-  for (const name of model.feature_names) {
-    if (name.startsWith("Keystone ")) {
-      const ksId = parseInt(name.replace("Keystone ", ""));
-      fv[`ks_${ksId}`] = keystone === ksId ? 1 : 0;
-    } else if (name.startsWith("SubStyle ")) {
-      const ssId = parseInt(name.replace("SubStyle ", ""));
-      fv[`ss_${ssId}`] = subStyle === ssId ? 1 : 0;
-    }
-  }
-
   // Champion interactions (label-encoded — use mean at inference since
   // the exact encoding from training isn't available, so SHAP ≈ 0)
   for (let i = 0; i < model.feature_names.length; i++) {
@@ -177,26 +146,8 @@ function extractFeatures(
   }
 
   return model.feature_names.map((name, i) => {
-    // Try direct column mapping
     const col = nameToCol[name];
     if (col && col in fv) return fv[col];
-    // Try one-hot features by prefix
-    if (name.startsWith("Item ")) {
-      const itemId = parseInt(name.replace("Item ", ""));
-      return fv[`item_${itemId}`] ?? model.feature_means[i];
-    }
-    if (name.startsWith("Spell ")) {
-      const spellId = parseInt(name.replace("Spell ", ""));
-      return fv[`spell_${spellId}`] ?? model.feature_means[i];
-    }
-    if (name.startsWith("Keystone ")) {
-      const ksId = parseInt(name.replace("Keystone ", ""));
-      return fv[`ks_${ksId}`] ?? model.feature_means[i];
-    }
-    if (name.startsWith("SubStyle ")) {
-      const ssId = parseInt(name.replace("SubStyle ", ""));
-      return fv[`ss_${ssId}`] ?? model.feature_means[i];
-    }
     // Fallback: use mean (SHAP = 0)
     return model.feature_means[i];
   });
