@@ -126,9 +126,15 @@ export async function fetchSynapseData(
     return { matches: [], hasMore: false };
   }
 
-  const allRows = result.recordset.map((row: { doc: string }) =>
-    slim(JSON.parse(row.doc))
-  );
+  const allRows = result.recordset.map((row: { doc: string }) => {
+    const raw = JSON.parse(row.doc);
+    const regionId = raw.data?.match?.matchSummary?.regionId;
+    const slimmed = slim(raw);
+    if (regionId) {
+      slimmed.shapValues = computeShapValues(raw, regionId) ?? undefined;
+    }
+    return slimmed;
+  });
 
   // Sort client-side by matchCreationTime descending
   allRows.sort(
@@ -142,13 +148,5 @@ export async function fetchSynapseData(
   const pageRows = allRows.slice(start, start + pageSize);
   const hasMore = allRows.length > page * pageSize;
 
-  return { matches: attachShapValues(pageRows), hasMore };
-}
-
-function attachShapValues(matches: MatchData[]): MatchData[] {
-  for (const m of matches) {
-    const regionId = m.match.matchSummary.regionId;
-    m.shapValues = computeShapValues(m, regionId) ?? undefined;
-  }
-  return matches;
+  return { matches: pageRows, hasMore };
 }

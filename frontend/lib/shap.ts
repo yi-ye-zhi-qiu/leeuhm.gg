@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
-import type { ShapResult, ShapValue, MatchData } from "@/types/match";
+import type { ShapResult, ShapValue } from "@/types/match";
 
 interface ShapModel {
   model_type: string;
@@ -28,65 +28,115 @@ function getModel(region: string): ShapModel | null {
   return model;
 }
 
-const TIER_MAP: Record<string, number> = {
-  IRON: 1,
-  BRONZE: 2,
-  SILVER: 3,
-  GOLD: 4,
-  PLATINUM: 5,
-  EMERALD: 6,
-  DIAMOND: 7,
-  MASTER: 8,
-  GRANDMASTER: 8,
-  CHALLENGER: 8,
-};
+// Phase classification matching train.py: early <25%, mid 25-50%, late >50%
+function phase(timestampMs: number, durationSec: number): 1 | 2 | 3 {
+  if (timestampMs < durationSec * 250) return 1;
+  if (timestampMs < durationSec * 500) return 2;
+  return 3;
+}
+
+interface DiffFrame {
+  timestamp?: number;
+  youValue?: number;
+  oppValue?: number;
+}
+
+function phaseAvg(frames: DiffFrame[] | null | undefined, durationSec: number): [number, number, number] {
+  if (!frames || frames.length === 0) return [0, 0, 0];
+  const buckets: [number[], number[], number[]] = [[], [], []];
+  for (const f of frames) {
+    const ts = f.timestamp ?? 0;
+    const p = phase(ts, durationSec);
+    const diff = (f.youValue ?? 0) - (f.oppValue ?? 0);
+    buckets[p - 1].push(diff);
+  }
+  return buckets.map(b => b.length > 0 ? b.reduce((a, v) => a + v, 0) / b.length : 0) as [number, number, number];
+}
 
 /**
- * Extract the feature vector from a match for the primary player.
- * Must match the order in train_xgb.py's build_feature_matrix().
+ * Extract features from the raw API blob (before slim() strips timelineData).
+ * Mirrors the Python feature extraction in db/scripts/features.py.
  */
 function extractFeatures(
-  data: MatchData,
+  raw: any,
   model: ShapModel
 ): number[] {
-  const ms = data.match.matchSummary;
-  const hist = data.match.historicalData;
-  const dm = ms.matchDuration / 60;
+  const m = raw.data.match;
+  const summary = m.matchSummary;
+  const hist = m.historicalData;
+  const durationSec = summary.matchDuration;
+  const primaryName = summary.riotUserName;
+  const primaryTag = summary.riotTagLine;
 
   // Find primary player in postGameData
-  const pgd = hist.postGameData.find(
-    (p) =>
-      p.riotUserName === ms.riotUserName && p.riotTagLine === ms.riotTagLine
+  const pgd = (hist.postGameData ?? []).find(
+    (p: any) => p.riotUserName === primaryName && p.riotTagLine === primaryTag
   );
 
-  // Rank lookup
-  const rankEntry = data.match.allPlayerRanks?.find(
-    (r) =>
-      r.riotUserName === ms.riotUserName && r.riotTagLine === ms.riotTagLine
-  );
-  const soloRank = rankEntry?.rankScores?.find(
-    (s) => s.queueType === "ranked_solo_5x5"
-  ) ?? rankEntry?.rankScores?.[0];
+  // Timeline data
+  const timeline: any[] = hist.timelineData ?? [];
 
-  // Build feature name → value map
-  const fv: Record<string, number> = {};
+  // Extract phase kills/deaths for primary player
+  const phaseCounts: Record<string, number> = {
+    early_kills: 0, mid_kills: 0, late_kills: 0,
+    early_deaths: 0, mid_deaths: 0, late_deaths: 0,
+  };
+  for (const e of timeline) {
+    if (e.eventType !== "champion_kill") continue;
+    const ts = e.timestamp ?? 0;
+    const p = phase(ts, durationSec);
+    const phaseName = p === 1 ? "early" : p === 2 ? "mid" : "late";
+    if (e.riotUserName === primaryName && e.riotTagLine === primaryTag) {
+      phaseCounts[`${phaseName}_kills`]++;
+    }
+    if (e.victimRiotUserName === primaryName && e.victimRiotTagLine === primaryTag) {
+      phaseCounts[`${phaseName}_deaths`]++;
+    }
+  }
 
-  // Per-minute rates
-  fv["damageTaken_pm"] = (pgd?.damageTaken ?? 0) / dm;
-  fv["wardsPlaced_pm"] = (pgd?.wardsPlaced ?? 0) / dm;
+  // Extract teamfights per phase (15s windows with 2+ kills)
+  const buckets: Record<number, number> = {};
+  for (const e of timeline) {
+    if (e.eventType !== "champion_kill") continue;
+    const bucket = Math.floor((e.timestamp ?? 0) / 15000);
+    buckets[bucket] = (buckets[bucket] ?? 0) + 1;
+  }
+  const teamfights: Record<string, number> = {
+    early_teamfights: 0, mid_teamfights: 0, late_teamfights: 0,
+  };
+  for (const [bucket, count] of Object.entries(buckets)) {
+    if (count >= 2) {
+      const ts = Number(bucket) * 15000;
+      const p = phase(ts, durationSec);
+      const phaseName = p === 1 ? "early" : p === 2 ? "mid" : "late";
+      teamfights[`${phaseName}_teamfights`]++;
+    }
+  }
 
-  // Raw stats
-  fv["visionScoreTotal"] = ms.visionScore ?? 0;
+  // Gold and KA diff frames (primary player only)
+  const goldDiff = phaseAvg(hist.goldDifferenceFrames, durationSec);
+  const kaDiff = phaseAvg(hist.kaDifferenceFrames, durationSec);
 
-  // Rank
-  fv["rank_tier_num"] = soloRank ? (TIER_MAP[soloRank.tier?.toUpperCase()] ?? 4) : 4;
+  // Build feature value map
+  const fv: Record<string, number> = {
+    // Streaks (not available at inference time)
+    win_streak: 0,
+    loss_streak: 0,
+    // Phase kills/deaths
+    ...phaseCounts,
+    // Gold diffs
+    gold_diff_early: goldDiff[0],
+    gold_diff_mid: goldDiff[1],
+    gold_diff_late: goldDiff[2],
+    // KA diffs
+    ka_diff_early: kaDiff[0],
+    ka_diff_mid: kaDiff[1],
+    ka_diff_late: kaDiff[2],
+    // Teamfights
+    ...teamfights,
+  };
 
-  // Streaks (not available at inference time, use 0)
-  fv["win_streak"] = 0;
-  fv["loss_streak"] = 0;
-
-  // Champion interactions (label-encoded — use mean at inference since
-  // the exact encoding from training isn't available, so SHAP ≈ 0)
+  // Champion interactions — use mean (SHAP ≈ 0)
   for (let i = 0; i < model.feature_names.length; i++) {
     const name = model.feature_names[i];
     if (name === "Lane Matchup" || name.startsWith("Synergy ")) {
@@ -94,17 +144,27 @@ function extractFeatures(
     }
   }
 
-  // Build vector in model feature order
-  // Map feature display names to column names
+  // Map display names to fv keys
   const nameToCol: Record<string, string> = {
-    "Dmg Taken/min": "damageTaken_pm",
-    "Wards/min": "wardsPlaced_pm",
-    "Vision Score": "visionScoreTotal",
-    "Rank": "rank_tier_num",
+    "Win Streak": "win_streak",
+    "Loss Streak": "loss_streak",
+    "Early Kills": "early_kills",
+    "Mid Kills": "mid_kills",
+    "Late Kills": "late_kills",
+    "Early Deaths": "early_deaths",
+    "Mid Deaths": "mid_deaths",
+    "Late Deaths": "late_deaths",
+    "Gold Diff Early": "gold_diff_early",
+    "Gold Diff Mid": "gold_diff_mid",
+    "Gold Diff Late": "gold_diff_late",
+    "KA Diff Early": "ka_diff_early",
+    "KA Diff Mid": "ka_diff_mid",
+    "KA Diff Late": "ka_diff_late",
+    "Early Teamfights": "early_teamfights",
+    "Mid Teamfights": "mid_teamfights",
+    "Late Teamfights": "late_teamfights",
     "Lane Matchup": "Lane Matchup",
   };
-  nameToCol["Win Streak"] = "win_streak";
-  nameToCol["Loss Streak"] = "loss_streak";
   for (let i = 0; i < 4; i++) {
     nameToCol[`Synergy ${i}`] = `Synergy ${i}`;
   }
@@ -112,7 +172,6 @@ function extractFeatures(
   return model.feature_names.map((name, i) => {
     const col = nameToCol[name];
     if (col && col in fv) return fv[col];
-    // Fallback: use mean (SHAP = 0)
     return model.feature_means[i];
   });
 }
@@ -121,14 +180,23 @@ function sigmoid(x: number): number {
   return 1 / (1 + Math.exp(-x));
 }
 
+/**
+ * Compute SHAP values from the raw API blob (before slim()).
+ * Must be called with the full document that includes timelineData.
+ */
 export function computeShapValues(
-  data: MatchData,
+  raw: any,
   regionId: string
 ): ShapResult | null {
   const model = getModel(regionId);
   if (!model) return null;
 
-  const features = extractFeatures(data, model);
+  let features: number[];
+  try {
+    features = extractFeatures(raw, model);
+  } catch {
+    return null;
+  }
   const { coefficients, feature_means, feature_names, intercept } = model;
 
   // Linear SHAP: shap_i = coef_i * (x_i - mean_i)
@@ -136,11 +204,12 @@ export function computeShapValues(
   let logitSum = intercept;
 
   for (let i = 0; i < coefficients.length; i++) {
-    const sv = coefficients[i] * (features[i] - feature_means[i]);
+    const fi = Number.isFinite(features[i]) ? features[i] : feature_means[i];
+    const sv = coefficients[i] * (fi - feature_means[i]);
     logitSum += sv;
     shapValues.push({
       feature: feature_names[i],
-      value: features[i],
+      value: fi,
       shapValue: sv,
     });
   }

@@ -26,7 +26,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -52,65 +52,40 @@ TIER_MAP = {
     "CHALLENGER": 8,
 }
 
-# Per-minute rate columns: (source_col, output_name, display_name)
-PM_RATES = [
-    ("damageTaken", "damageTaken_pm", "Dmg Taken/min"),
-    ("wardsPlaced", "wardsPlaced_pm", "Wards/min"),
-]
-
-# Raw SQL columns used directly as features
-RAW_FEATURES = [
-    ("visionScoreTotal", "Vision Score"),
-]
-
-RANK_FEATURES = [
-    ("rank_tier_num", "Rank"),
-]
+PM_RATES = []
+RAW_FEATURES = []
+RANK_FEATURES = []
+OBJECTIVE_FEATURES = []
+PERFORMANCE_FEATURES = []
 
 STREAK_THRESHOLD = 2
 
-OBJECTIVE_FEATURES = []
-
-PERFORMANCE_FEATURES = [
-    ("teamplay", "Teamplay"),
-    ("damageShareTotal", "Damage Share"),
-    ("goldShareTotal", "Gold Share"),
-    ("killParticipationTotal", "Kill Participation"),
-    ("visionScoreTotal", "Vision Score (perf)"),
-    ("finalLvlDiffTotal", "Level Diff"),
-]
-
-# Removed late_deaths (proxy for win/loss)
 PHASE_FEATURES = [
     ("early_kills", "Early Kills"),
     ("mid_kills", "Mid Kills"),
     ("late_kills", "Late Kills"),
     ("early_deaths", "Early Deaths"),
     ("mid_deaths", "Mid Deaths"),
-    ("early_wards", "Early Wards"),
-    ("mid_wards", "Mid Wards"),
-    ("late_wards", "Late Wards"),
+    ("late_deaths", "Late Deaths"),
+]
+
+GOLD_DIFF_FEATURES = [
+    ("gold_diff_early", "Gold Diff Early"),
+    ("gold_diff_mid", "Gold Diff Mid"),
+    ("gold_diff_late", "Gold Diff Late"),
+]
+
+# KA = kills + assists differential vs opponent
+KA_DIFF_FEATURES = [
+    ("ka_diff_early", "KA Diff Early"),
+    ("ka_diff_mid", "KA Diff Mid"),
+    ("ka_diff_late", "KA Diff Late"),
 ]
 
 TEAMFIGHT_FEATURES = [
     ("early_teamfights", "Early Teamfights"),
     ("mid_teamfights", "Mid Teamfights"),
     ("late_teamfights", "Late Teamfights"),
-]
-
-DIFF_FEATURES = [
-    ("cs_diff_early", "CS Diff Early"),
-    ("cs_diff_mid", "CS Diff Mid"),
-    ("cs_diff_late", "CS Diff Late"),
-    ("gold_diff_early", "Gold Diff Early"),
-    ("gold_diff_mid", "Gold Diff Mid"),
-    ("gold_diff_late", "Gold Diff Late"),
-    ("ka_diff_early", "KA Diff Early"),
-    ("ka_diff_mid", "KA Diff Mid"),
-    ("ka_diff_late", "KA Diff Late"),
-    ("xp_diff_early", "XP Diff Early"),
-    ("xp_diff_mid", "XP Diff Mid"),
-    ("xp_diff_late", "XP Diff Late"),
 ]
 
 
@@ -264,23 +239,19 @@ def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], lis
     feature_cols.append("loss_streak")
     feature_names.append("Loss Streak")
 
-    for col, name in OBJECTIVE_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
-    for col, name in PERFORMANCE_FEATURES:
-        feature_cols.append(col)
-        feature_names.append(name)
-
     for col, name in PHASE_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    for col, name in TEAMFIGHT_FEATURES:
+    for col, name in GOLD_DIFF_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
-    for col, name in DIFF_FEATURES:
+    for col, name in KA_DIFF_FEATURES:
+        feature_cols.append(col)
+        feature_names.append(name)
+
+    for col, name in TEAMFIGHT_FEATURES:
         feature_cols.append(col)
         feature_names.append(name)
 
@@ -319,11 +290,23 @@ def train_region(region: str, parquet_path: str | None = None, limit: int | None
     X_train_s = scaler.fit_transform(X_train)
     X_test_s = scaler.transform(X_test)
 
-    model = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
+    # ElasticNet (L1+L2) with CV-tuned C to spread weight across features
+    # Lower C = stronger regularization = more even coefficient distribution
+    model = LogisticRegressionCV(
+        Cs=[0.001, 0.01, 0.1, 0.5, 1.0],
+        penalty="elasticnet",
+        solver="saga",
+        l1_ratios=[0.5],  # 50/50 mix of L1 (sparsity) and L2 (shrinkage)
+        max_iter=2000,
+        cv=5,
+        random_state=42,
+        n_jobs=-1,
+    )
     model.fit(X_train_s, y_train)
 
+    best_C = float(model.C_[0])
     accuracy = float(model.score(X_test_s, y_test))
-    log.info("%s: accuracy = %.4f", region, accuracy)
+    log.info("%s: accuracy = %.4f (best C = %.4f)", region, accuracy, best_C)
 
     # For linear SHAP: coef and mean are in original (unscaled) space
     # scaled_coef * (x - mean) / std = original_coef * (x - mean)
